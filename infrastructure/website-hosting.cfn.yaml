@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Host a static website using S3 and Cloudfront.
+  Provides https access and redirect from www to apex domain
+  Expects a CloudFormation Export containing the ARN of an AWS Certificate Manager (ACM) certificate...
+
+Parameters:
+
+  ApexDomain:
+    Type: String
+    Description: >
+      Apex Domain for web site, e.g. mysite.com (not www.mysite.com)
+    MinLength: 1
+
+Resources:
+
+  OriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Ref ApexDomain
+
+  WebResourcesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: # private bucket, only CloudFront can access
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WebResourcesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebResourcesBucket
+      PolicyDocument:
+        Statement:
+          - Action: s3:GetObject
+            Effect: Allow
+            Resource: !Sub 'arn:aws:s3:::${WebResourcesBucket}/*'
+            Principal:
+              CanonicalUser: !GetAtt OriginAccessIdentity.S3CanonicalUserId
+          - Action: s3:ListBucket
+            Effect: Allow
+            Resource: !Sub 'arn:aws:s3:::${WebResourcesBucket}'
+            Principal:
+              CanonicalUser: !GetAtt OriginAccessIdentity.S3CanonicalUserId
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Ref ApexDomain
+        Enabled: true
+        Origins:
+          - DomainName: !Sub '${WebResourcesBucket}.s3.amazonaws.com' # using us-east-1; otherwise use region specific url to avoid redirect to bucket issue
+            Id: 'web-app'
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${OriginAccessIdentity}'
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: 'web-app'
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+        PriceClass: PriceClass_All
+        HttpVersion: http2
+        Aliases:
+          - !Ref ApexDomain
+        ViewerCertificate:
+          AcmCertificateArn:
+            Fn::ImportValue: !Sub
+              - '${CertificateStackNameBase}-certificate:certificate-arn'
+              - { CertificateStackNameBase : !Join [ '-', !Split [ '.', !Ref ApexDomain ] ]} # domain names are not valid stack names - by convention replace dots with dashes
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2018
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 0 # don't cache errors
+            ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCachingMinTTL: 0
+            ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  WebsiteDNSRecordSet:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Sub '${ApexDomain}.' # Route53 needs a dot on the end
+      RecordSets:
+        - Name: !Ref ApexDomain
+          Type: A
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2 # magic value for all CloudFront distributions
+            DNSName: !GetAtt Distribution.DomainName
+
+Outputs:
+  WebResourcesBucket:
+    Value: !Ref WebResourcesBucket

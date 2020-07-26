@@ -1,0 +1,13 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      nodejs: 10.x
+  build:
+    commands:
+      - pipeline/build.sh
+artifacts:
+  files:
+    - 'infrastructure/*' # all cloudformation resources
+    - 'pipeline/*' # sync built web-app into s3
+    - 'web-app/build/**'  # web-app built for production

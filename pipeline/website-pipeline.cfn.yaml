@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CD pipeline to deploy single page app website from GitHub source.
+
+Parameters:
+
+  ApexDomain:
+    Type: String
+    Description: Apex Domain for web site, e.g. mysite.com (not www.mysite.com)
+    MinLength: 1
+
+  GitHubRepoName:
+    Type: String
+    Description: Github repo holding source code to build
+    MinLength: 1
+
+Resources:
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStoreBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: FetchSource
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              OutputArtifacts:
+                - Name: SourceCode
+              Configuration:
+                PollForSourceChanges: false
+                Owner: '{{resolve:secretsmanager:github-access:SecretString:Username}}'
+                OAuthToken: '{{resolve:secretsmanager:github-access:SecretString:AccessToken}}'
+                Repo: !Ref GitHubRepoName
+                Branch: master
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildWebApp
+              RunOrder: 1
+              InputArtifacts:
+                - Name: SourceCode
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref BuildProject
+              OutputArtifacts:
+                - Name: BuiltApplication
+        - Name: Deploy
+          Actions:
+            - Name: DeployInfrastructure
+              RunOrder: 1
+              InputArtifacts:
+                - Name: BuiltApplication
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub
+                  - '${Domain}-website-hosting'
+                  - { Domain: !Join [ '-', !Split [ '.', !Ref ApexDomain ] ] } # replace dots with dashes
+                RoleArn: !GetAtt CodeFormationRole.Arn
+                TemplatePath: BuiltApplication::infrastructure/website-hosting.cfn.yaml
+                ParameterOverrides: !Sub
+                  - >
+                      {
+                        "ApexDomain" : "${Domain}"
+                      }
+                  - { Domain : !Ref ApexDomain }
+              Namespace: WebsiteHostingStack
+
+            - Name: SyncWebAppResources
+              RunOrder: 2
+              InputArtifacts:
+                - Name: BuiltApplication
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref SyncProject
+                EnvironmentVariables: >
+                  [
+                    { "name":"TARGET_BUCKET", "value": "#{WebsiteHostingStack.WebResourcesBucket}" }
+                  ]
+
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codepipeline.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess # TODO Restrict
+
+  GitHubWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: '{{resolve:secretsmanager:github-access:SecretString:AccessToken}}'
+      Filters:
+        -
+          JsonPath: "$.ref"
+          MatchEquals: refs/heads/{Branch}
+      TargetPipeline: !Ref Pipeline
+      TargetPipelineVersion: !GetAtt Pipeline.Version
+      TargetAction: FetchSource
+      Name: !Sub '${AWS::StackName}-fetchsource'
+      RegisterWithThirdParty: true
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess # TODO Restrict
+
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      Description: build from source
+      ServiceRole: !Ref BuildRole
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/build-spec.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+      Artifacts:
+        Type: CODEPIPELINE
+
+  CodeFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess # TODO Restrict
+
+  SyncProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-sync
+      Description: sync web app resources to s3
+      ServiceRole: !Ref SyncRole  # TODO : make more specific role
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/sync-spec.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+      Artifacts:
+        Type: CODEPIPELINE
+
+  SyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess # TODO Restrict
